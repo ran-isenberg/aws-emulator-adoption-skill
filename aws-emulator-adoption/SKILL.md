@@ -4,7 +4,8 @@ description: >-
   Adopts AWS Emulator for a serverless service's local runs and integration tests, and tells the user, with evidence,
   whether the service can run fully on the emulator or needs workarounds. Installs it (Docker on macOS/Windows,
   the Debian/RPM package on Linux and CI), writes the Dockerfile, config, env file, Makefile targets, CI step and
-  test guard, then inventories the service (CDK or Terraform, SDK calls, third-party clients), checks every used
+  test guard, then inventories the service (CDK or Terraform; SDK calls and libraries in Python, JavaScript/TypeScript,
+  Java/Kotlin, Go, Rust and .NET; third-party clients), checks every used
   operation against the emulator's known-gaps list, GitHub issues and per-release scores, probes the risky ones on
   the latest build, and writes a per-feature verdict, with the workaround and the coverage it costs, to a local
   `aws-emulator-report.md`. Use when the user
@@ -237,23 +238,36 @@ grep -rnE 'lambda_config|event_source_mapping|authorizer|aws_lambda_permission|n
 
 ### 3b. Application code: SDK clients and operations
 
+Define this helper first. It searches the repo but skips dependency and build folders. Options go before `-e`,
+because macOS (BSD) grep stops reading options at the first non-option.
+
 ```bash
-# Python
-grep -rnoE "boto3\.(client|resource)\(\s*['\"][a-z0-9-]+['\"]" --include='*.py' . | grep -v -e .venv -e node_modules
-OPS='put_item|get_item|query|scan|update_item|delete_item|transact_write_items|batch_write_item|send_message|publish'
-OPS="$OPS|put_events|invoke|get_object|put_object|initiate_auth|admin_initiate_auth|get_secret_value|get_parameter"
-grep -rnoE "\.($OPS|start_execution)\(" --include='*.py' . | grep -v .venv
-# JavaScript/TypeScript (v3): client packages and Command classes
-grep -rhoE "@aws-sdk/client-[a-z0-9-]+" --include='*.[jt]s' . | sort -u
-grep -rhoE "new [A-Z][A-Za-z]+Command\(" --include='*.[jt]s' . | sort | uniq -c
-# Java / Go / Rust / .NET
-grep -rhoE "software\.amazon\.awssdk\.services\.[a-z0-9]+" --include='*.java' . | sort -u
-grep -rhoE "aws-sdk-go-v2/service/[a-z0-9]+" --include='*.go' . | sort -u
-grep -rhoE "aws-sdk-[a-z0-9]+" Cargo.toml */Cargo.toml 2>/dev/null | sort -u
-grep -rhoE "AWSSDK\.[A-Za-z0-9]+" --include='*.csproj' . | sort -u
+g() { local pat=$1; shift; grep -rhoE --exclude-dir={node_modules,.venv,venv,target,cdk.out,.terraform,.git,bin,obj,dist,build} "$@" -e "$pat" .; }
 ```
 
-Map snake_case to API names (`put_item` → `PutItem`), and list operations per service.
+Find the **services** (the SDK client or package names) and the **operations** (the API names) for each language
+in the repo:
+
+| Language | Services | Operations |
+| --- | --- | --- |
+| Python (boto3) | `g "boto3\.(client\|resource)\(\s*['\"][a-z0-9-]+['\"]" --include='*.py'` | `g "\.($OPS)\(" --include='*.py'` with `$OPS` below |
+| JavaScript/TypeScript (v3) | `g "@aws-sdk/client-[a-z0-9-]+" --include='*.[jt]s' --include=package.json` | `g "new [A-Z][A-Za-z]+Command\(" --include='*.[jt]s'` |
+| Java/Kotlin (v2) | `g "software\.amazon\.awssdk\.services\.[a-z0-9]+" --include='*.java' --include='*.kt' --include=pom.xml --include='build.gradle*'` | `g "\b[A-Z][A-Za-z0-9]+Request\b" --include='*.java' --include='*.kt'` (`PutItemRequest` → `PutItem`), plus `g "\.[a-z][A-Za-z0-9]+\(\s*[a-z]\s*->" --include='*.java'` for lambda-builder calls such as `sendMessage(b -> ...)` |
+| Go (v2) | `g "aws-sdk-go-v2/service/[a-z0-9]+" --include='*.go' --include=go.mod` | `g "&[a-z0-9]+\.[A-Z][A-Za-z0-9]+Input\{" --include='*.go'` (`&dynamodb.PutItemInput{` → service and operation) |
+| Rust | `g "aws-sdk-[a-z0-9]+" --include=Cargo.toml` | `g "\.[a-z][a-z0-9_]*\(\)" --include='*.rs'`, minus `send`, `await`, `build`, `unwrap`, `clone`, `into` and other non-AWS calls (`.put_item()` → `PutItem`) |
+| .NET | `g "AWSSDK\.[A-Za-z0-9]+" --include='*.csproj'` | `g "\b[A-Z][A-Za-z0-9]+Async\(" --include='*.cs'` (`PutItemAsync(` → `PutItem`) |
+
+Python's operation list (extend it with what the services from the first column offer):
+
+```bash
+OPS='put_item|get_item|query|scan|update_item|delete_item|transact_write_items|batch_write_item|send_message|publish'
+OPS="$OPS|put_events|invoke|get_object|put_object|initiate_auth|admin_initiate_auth|get_secret_value|get_parameter|start_execution"
+```
+
+Pipe each result through `sort | uniq -c`. Map the names to API operation names (`put_item` → `PutItem`,
+`PutItemAsync` → `PutItem`), and list operations per service. These patterns are a first pass: in Java, .NET and
+Rust especially, read the data-access layer to confirm, and drop non-AWS matches (your own `*Request` classes, other
+`*Async` methods).
 
 ### 3c. Libraries that call AWS for you, and clients that bypass the SDK
 
@@ -261,24 +275,40 @@ These are the usual blind spots. A service can have no direct SDK calls at all a
 through libraries, so always run:
 
 ```bash
+# Python, JavaScript/TypeScript
 LIBS='aws_lambda_powertools\.utilities\.[a-z_]+|@aws-lambda-powertools/[a-z-]+|pydynox|pynamodb|dynamoose|electrodb'
-LIBS="$LIBS|psycopg2?|asyncpg|pymysql|sqlalchemy|redis|kafka|opensearch[a-z-]*|jwt|jose"
-grep -rhoiE "$LIBS" --include='*.py' --include='*.[jt]s' --include='package.json' --include='pyproject.toml' . \
-  | grep -v -e node_modules -e .venv | sort | uniq -c | sort -rn
+LIBS="$LIBS|aws-jwt-verify|psycopg2?|asyncpg|pymysql|sqlalchemy|mysql2|prisma|ioredis|redis|kafkajs|kafka|opensearch[a-z-]*|jwt|jose"
+# Java/Kotlin
+LIBS="$LIBS|software\.amazon\.lambda\.powertools|io\.awspring\.cloud|dynamodb\.enhanced|jdbc:[a-z]+|software\.amazon\.jdbc"
+LIBS="$LIBS|nimbus-jose-jwt|lettuce|jedis"
+# Go
+LIBS="$LIBS|github\.com/jackc/pgx|github\.com/lib/pq|go-sql-driver/mysql|github\.com/guregu/dynamo|go-redis|kafka-go|lestrrat-go/jwx"
+# Rust, .NET
+LIBS="$LIBS|sqlx|tokio-postgres|serde_dynamo|AWS\.Lambda\.Powertools|Npgsql|MySqlConnector|Amazon\.DynamoDBv2\.DataModel"
+LIBS="$LIBS|StackExchange\.Redis|Confluent\.Kafka"
+g "$LIBS" -i --include='*.py' --include='*.[jt]s' --include='*.java' --include='*.kt' --include='*.go' --include='*.rs' \
+  --include='*.cs' --include=package.json --include=pyproject.toml --include='requirements*.txt' --include=pom.xml \
+  --include='build.gradle*' --include=go.mod --include=Cargo.toml --include='*.csproj' | sort | uniq -c | sort -rn
 ```
 
 - **Higher-level libraries.** Find out which operations they call:
-    - Powertools: idempotency uses DynamoDB `PutItem`/`UpdateItem`/`DeleteItem`/`GetItem`; feature flags use AppConfig
-    or AppConfigData; parameters use SSM, Secrets Manager or AppConfig; JWT verification fetches JWKS over HTTP.
-    - ORMs and object mappers such as PynamoDB, pydynox, Dynamoose, ElectroDB, or the DynamoDB enhanced client.
+    - **Powertools** (Python, TypeScript, Java, .NET): idempotency uses DynamoDB
+      `PutItem`/`UpdateItem`/`DeleteItem`/`GetItem`; feature flags use AppConfig or AppConfigData; parameters use SSM,
+      Secrets Manager or AppConfig; JWT verification fetches JWKS over HTTP.
+    - **Object mappers:** PynamoDB, pydynox, Dynamoose, ElectroDB, the Java DynamoDB enhanced client, .NET
+      `DynamoDBContext`, guregu/dynamo, serde_dynamo.
+    - **Framework integrations:** Spring Cloud AWS (SQS listeners, Parameter Store and Secrets Manager config, S3).
 - **Direct network clients.** These don't use the AWS SDK, so `AWS_ENDPOINT_URL` doesn't redirect them:
-    - database drivers and ORMs (psycopg, asyncpg, PyMySQL, SQLAlchemy, JDBC, Prisma) for RDS and Aurora;
-    - Redis or Valkey clients (ElastiCache), Kafka clients (MSK), OpenSearch HTTP clients;
-    - JWKS or OIDC fetches.
+    - **Databases (RDS and Aurora):** psycopg, asyncpg, PyMySQL, SQLAlchemy, pg, mysql2, Prisma, JDBC and the AWS
+      JDBC wrapper, pgx, lib/pq, go-sql-driver, sqlx, tokio-postgres, Npgsql, MySqlConnector.
+    - **Caches and streams:** Redis or Valkey clients (ElastiCache), Kafka clients (MSK), OpenSearch HTTP clients.
+    - **Tokens:** JWKS or OIDC fetches: `aws-jwt-verify`, Powertools, nimbus-jose-jwt, jwx, jose.
 - **Hard-coded AWS hosts** won't hit the emulator either:
 
   ```bash
-  grep -rnE "amazonaws\.com|amazoncognito\.com|\.on\.aws|cognito-idp\.\{?" --include='*.py' --include='*.[jt]s' --include='*.go' --include='*.java' . | grep -v -e node_modules -e .venv
+  grep -rnE --exclude-dir={node_modules,.venv,venv,target,cdk.out,.terraform,.git,bin,obj,dist,build} \
+    --include='*.py' --include='*.[jt]s' --include='*.go' --include='*.java' --include='*.kt' --include='*.rs' \
+    --include='*.cs' -e "amazonaws\.com|amazoncognito\.com|\.on\.aws|cognito-idp\.\{?" .
   ```
 
 - **Limits the tests will hit:**
@@ -440,8 +470,13 @@ same call sequence the service makes, against the latest build.
 
 Probe rules:
 
-- Run probes with the emulator env (step 2) and `uv run python -I` (or the repo's runtime). Keep probe scripts in
-  scratch, not in the repo.
+- Run probes with the emulator env (step 2). Keep probe scripts in scratch, not in the repo.
+- **Which language to probe in:**
+    - Emulator behavior is server-side, so a Python or AWS CLI probe answers "does Cognito run the trigger?" for a
+      Java service too. Use whatever is fastest.
+    - Probe in the **repo's own SDK** when the risk is client-side: TLS and CA trust (the Java truststore, Rust or
+      .NET `SSL_CERT_FILE`), request checksums, retries, waiters, paginators, or an object mapper's request shape
+      (enhanced client, `DynamoDBContext`, pydynox).
 - Test the **effect**, not only the API response. Examples:
     - A trigger "accepted" in `LambdaConfig` must also *run*: sign in and look for the claim it adds.
     - A JWKS must have the key type your verifier expects.
@@ -488,8 +523,8 @@ point (safe agentic runs, no deploy wait). Mix with mocks or local containers on
 ## 7. Wire it in
 
 - **Test guard.** Integration tests refuse to run unless `AWS_ENDPOINT_URL` points at `127.0.0.1` or `localhost`,
-  so a misconfigured run can't reach a real account. In pytest, check this in `pytest_sessionstart` and call
-  `pytest.exit(...)` if it fails.
+  so a misconfigured run can't reach a real account. It must **fail** the run, not skip tests: a skipped suite looks
+  green. Put it in the framework's once-per-run hook (see "Test guard per framework" below).
 - **Fixtures** create resources with unique names per session and delete them afterwards.
 - **CI:** install with the same task-runner target on Linux, then start, test and stop. Put the job in no
   deployment environment, with no `id-token: write` and `permissions: contents: read`, so it can't assume an AWS
@@ -498,6 +533,83 @@ point (safe agentic runs, no deploy wait). Mix with mocks or local containers on
 - **Agent permissions:** the emulator-backed test targets can be allow-listed. Deploy, destroy, `terraform apply`
   and the `aws` CLI stay ask-first.
 - **Docs:** add a "known gaps and workarounds" section listing each workaround and the issue that would remove it.
+
+### Test guard per framework
+
+**pytest** (`tests/integration/conftest.py`):
+
+```python
+def pytest_sessionstart(session):
+    host = urlparse(os.environ.get('AWS_ENDPOINT_URL', '')).hostname
+    if host not in {'127.0.0.1', 'localhost'}:
+        pytest.exit(f'integration tests run only against AWS Emulator, AWS_ENDPOINT_URL={host!r}', returncode=1)
+```
+
+**Jest** (`globalSetup` in the Jest config). For **Vitest**, export the same function as the default export of its
+`globalSetup` file:
+
+```js
+module.exports = async () => {
+  const host = new URL(process.env.AWS_ENDPOINT_URL ?? 'http://invalid').hostname;
+  if (!['127.0.0.1', 'localhost'].includes(host)) {
+    throw new Error(`integration tests run only against AWS Emulator, AWS_ENDPOINT_URL=${process.env.AWS_ENDPOINT_URL}`);
+  }
+};
+```
+
+**JUnit 5** (a base class or extension for the integration tests; throw, don't use `assumeTrue`, which skips):
+
+```java
+@BeforeAll
+static void requireEmulator() {
+    String host = URI.create(System.getenv().getOrDefault("AWS_ENDPOINT_URL", "http://invalid")).getHost();
+    if (!Set.of("127.0.0.1", "localhost").contains(host)) {
+        throw new IllegalStateException("integration tests run only against AWS Emulator");
+    }
+}
+```
+
+**Go** (`TestMain` in the integration test package). Run the integration tests with `go test -count=1`: Go's test
+cache can replay an earlier pass after `AWS_ENDPOINT_URL` changes, so the guard never runs.
+
+```go
+func TestMain(m *testing.M) {
+	u, err := url.Parse(os.Getenv("AWS_ENDPOINT_URL"))
+	if err != nil || (u.Hostname() != "127.0.0.1" && u.Hostname() != "localhost") {
+		fmt.Fprintln(os.Stderr, "integration tests run only against AWS Emulator")
+		os.Exit(1)
+	}
+	os.Exit(m.Run())
+}
+```
+
+**.NET / xUnit** (a module initializer runs before any test in the assembly):
+
+```csharp
+static class EmulatorGuard
+{
+    [System.Runtime.CompilerServices.ModuleInitializer]
+    internal static void Require()
+    {
+        var host = new Uri(Environment.GetEnvironmentVariable("AWS_ENDPOINT_URL") ?? "http://invalid").Host;
+        if (host is not ("127.0.0.1" or "localhost"))
+            throw new InvalidOperationException("integration tests run only against AWS Emulator");
+    }
+}
+```
+
+**Rust** has no once-per-run hook in the standard test harness. Call this from the shared client builder that every
+integration test uses, or use embedded mode, which needs no endpoint at all:
+
+```rust
+fn require_emulator() {
+    let ep = std::env::var("AWS_ENDPOINT_URL").unwrap_or_default();
+    assert!(
+        ep.starts_with("https://127.0.0.1:") || ep.starts_with("https://localhost:"),
+        "integration tests run only against AWS Emulator, AWS_ENDPOINT_URL={ep}"
+    );
+}
+```
 
 ## 8. Write the report file
 

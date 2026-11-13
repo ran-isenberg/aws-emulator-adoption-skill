@@ -52,9 +52,10 @@ needs a workaround (and the coverage that costs), and what has to stay in e2e.
 3. **Inventories your service:**
     - **CDK** (`cdk synth`) or **Terraform** (static `aws_*` resources and data sources), plus SAM and the
       Serverless Framework;
-    - SDK calls in Python, JS/TS, Java, Go, Rust and .NET;
-    - libraries that call AWS for you (Powertools, ORMs), and clients that bypass the SDK (database drivers, JWKS
-      fetches, hard-coded AWS hosts).
+    - the services *and operations* your code calls, in Python, JavaScript/TypeScript, Java/Kotlin, Go, Rust and
+      .NET;
+    - libraries that call AWS for you (Powertools, object mappers, Spring Cloud AWS), and clients that bypass the SDK
+      (database drivers, Redis, Kafka, JWKS fetches, hard-coded AWS hosts).
 4. **Collects gap evidence** for every service and operation you use:
     - per-release **scores** per service and per operation (a bundled helper reads `scores.json.gz`);
     - the **known-gaps folder** (sparse checkout of only your services, about 2 seconds), indexed by severity and
@@ -67,6 +68,24 @@ needs a workaround (and the coverage that costs), and what has to stay in e2e.
 7. **Wires it in:** a test guard that refuses non-local endpoints, credential-free CI jobs and agent permissions.
 8. **Writes `aws-emulator-report.md`** in your repo: the verdict, how to run locally, the feature table, the
    workarounds, what to re-check on each release, security notes and the evidence.
+
+### Which languages?
+
+The setup, the gap evidence and the verdict don't depend on your language: the emulator is a network endpoint, and
+the gaps are per AWS service and operation. Language-specific support covers finding what your code calls, trusting
+the emulator's CA, and failing the test run if it isn't pointed at the emulator:
+
+| Language | Finds services and operations | CA trust | Test guard |
+| --- | --- | --- | --- |
+| Python | `boto3` clients, `put_item(` → `PutItem` | `AWS_CA_BUNDLE` | pytest `pytest_sessionstart` |
+| JavaScript/TypeScript | `@aws-sdk/client-*`, `new PutItemCommand(` | `NODE_EXTRA_CA_CERTS` | Jest / Vitest `globalSetup` |
+| Java/Kotlin | `software.amazon.awssdk.services.*`, `PutItemRequest` | truststore from `ca.pem` | JUnit 5 `@BeforeAll` |
+| Go | `aws-sdk-go-v2/service/*`, `&dynamodb.PutItemInput{` | `AWS_CA_BUNDLE` | `TestMain` |
+| Rust | `aws-sdk-*` crates, `.put_item()` | `SSL_CERT_FILE` | shared client builder (or embedded mode) |
+| .NET | `AWSSDK.*` packages, `PutItemAsync(` | `SSL_CERT_FILE` | xUnit module initializer |
+
+It also knows the common libraries for each ecosystem: Powertools (Python, TypeScript, Java and .NET), DynamoDB
+object mappers, Spring Cloud AWS, and database, Redis and Kafka clients.
 
 ### CDK or Terraform?
 
@@ -105,7 +124,8 @@ mkdir -p .claude/skills && cp -r aws-emulator-adoption-skill/aws-emulator-adopti
 **Other agents:** any agent that loads `SKILL.md`-style skills can use the folder as is. Otherwise, paste `SKILL.md`
 into the agent's instructions.
 
-**Requirements:** `git`, `gh` (GitHub CLI), `python3` and `jq`. Docker on macOS and Windows; on Linux, a Debian-based
+**Requirements:** `git`, `gh` (GitHub CLI), `python3` (for the scores helper, whatever your service's language) and
+`jq`. Docker on macOS and Windows; on Linux, a Debian-based
 system with `sudo` (or adapt the RPM line).
 
 ## Use it
